@@ -1,0 +1,226 @@
+#include <climits>
+#include <cstddef>
+#include <iostream>
+#include <atomic>
+#include <memory>
+#include <ostream>
+#include <random>
+#include <ctime>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+#include <chrono>
+#include <exception>
+
+void tag(std::thread::id id, size_t size) {
+	std::default_random_engine e;
+	e.seed(time(0));
+	std::cout << "tag " << id << " " << size << " " << e() << std::endl;
+}
+
+template<typename T>
+class LockFreeStack {
+public:
+	LockFreeStack() {}
+	LockFreeStack(const LockFreeStack&) = delete;
+	LockFreeStack& operator=(const LockFreeStack&) = delete;
+	virtual void push(const T& data) = 0;
+	virtual std::shared_ptr<T> pop() = 0;
+	virtual bool empty() = 0;
+	virtual size_t size() = 0;
+protected:
+	struct Node {
+		std::shared_ptr<T> data;
+		Node *next;
+		Node(const T& data) {
+			this->data = std::make_shared<T>(data);
+		}
+	};
+	std::atomic<Node*> head;
+	std::atomic<size_t> size_;
+	std::atomic<Node*> delete_nodes;
+};
+
+template<typename T>
+class LockFreeStackCount final: public LockFreeStack<T> {
+	using Node = typename LockFreeStack<T>::Node;
+public:
+	LockFreeStackCount() {
+		this->head.store(nullptr);
+		this->threads_in_pop.store(0);
+		to_be_deleted.store(nullptr);
+		this->size_.store(0);
+	}
+	~LockFreeStackCount() {}
+	void push(const T& data) {
+		Node *new_node = new Node(data);
+		/*
+		do {
+			new_node->next = this->head;
+		} while(!this->head.compare_exchange_weak(new_node->next, new_node));
+		*/
+		while(!this->head.compare_exchange_weak(new_node->next, new_node));
+		this->size_.fetch_add(1);
+	}	
+	std::shared_ptr<T> pop() {
+		this->threads_in_pop.fetch_add(1);
+		Node *old_node;
+		do {
+			old_node = this->head.load();
+			if(old_node == nullptr) {
+				this->threads_in_pop.fetch_sub(1);
+				return std::shared_ptr<T>();
+			}
+		} while(!this->head.compare_exchange_weak(old_node, old_node->next));
+		std::shared_ptr<T> ret;
+		if(old_node) {
+			ret.swap(old_node->data);
+			old_node->next = nullptr;
+		}
+		try_delete(old_node);
+		this->size_.fetch_sub(1);
+		return ret;
+		return std::shared_ptr<T>();
+	}
+	bool empty() {
+		return (this->head.load() == nullptr);
+	}
+	size_t size() {
+		return this->size_.load();
+	}
+private:
+	std::atomic<int> threads_in_pop;
+	std::atomic<Node*> to_be_deleted;
+	void try_delete(Node *node) {
+		if(this->threads_in_pop.load() == 1) {
+			Node *nodes = to_be_deleted.exchange(nullptr);	
+			if(!--threads_in_pop) {
+				while(nodes != nullptr) {
+					//tag(std::this_thread::get_id(), 0);
+					Node *tmp = nodes;
+					nodes = nodes->next;
+					try {
+						if(tmp == nullptr) std::runtime_error("segmention fault!!!!!!!!!!!!!!!!!!!!");
+						delete tmp;
+					} catch(std::exception& e) {
+						std::cout << "delete nodes error" << std::endl;
+						std::cout << e.what() << std::endl;
+					}
+				}
+			} else if(nodes) {
+				insert_to_delete(nodes);	
+			}
+			try {
+				if(node == nullptr) throw std::runtime_error("segmention fault");
+				delete node;
+			} catch(std::exception& e) {
+				std::cout << "delete node error" << std::endl;
+				std::cout << e.what() << std::endl;
+			}
+			//tag(std::this_thread::get_id(), size());
+		} else {
+			insert_to_delete(node);
+			this->threads_in_pop.fetch_sub(1);
+		}
+	}
+	void insert_to_delete(Node *node) {
+		Node *head = node;
+		Node *tail = node;
+		while(node != nullptr) {
+			tail = node;
+			node = node->next;
+		}
+		do {
+			tail->next = to_be_deleted;
+		} while(!to_be_deleted.compare_exchange_weak(tail->next, head));
+		//while(!to_be_deleted.compare_exchange_weak(tail->next, head));
+	}
+};
+
+template<typename T>
+class LockFreeStackHazardPointer final: public LockFreeStack<T> {
+public:
+
+private:
+	
+};
+
+template<typename T>
+class LockFreeStackReference final: public LockFreeStack<T> {
+
+};
+
+class TestClass {
+public:
+	TestClass(int id, std::string name): id(id), name(name) {
+	}
+	~TestClass() {
+	}
+	int id;
+	std::string name;
+	static std::default_random_engine e;
+	static TestClass random_test_class() {
+		int len = e() % 20;
+		std::string name;
+		for(int i = 0; i < len; i++) name.push_back((e() % (127 - 33)) + 33);
+		return std::move(TestClass{static_cast<int>(e()), std::move(name)});
+	}
+	friend std::ostream& operator<<(std::ostream& out, const TestClass& tc) {
+		out << "TestClass {" << "id: " <<tc.id << ", name: " << tc.name  << "}";
+		return out;
+	}
+};
+std::default_random_engine TestClass::e(time(nullptr));
+
+void test_lock_free_stack_count() {
+	LockFreeStackCount<TestClass> stack;
+	auto thread_to_push = [&stack]() {
+		for(unsigned long long i = 0; i < 1000000; i++) {
+			try {
+			stack.push(TestClass::random_test_class());	
+			} catch(std::exception& e) {
+				std::cout << e.what() << std::endl;
+				std::cout << "push error" << std::endl;
+			}
+			//std::cout << stack.size() << std::endl;
+			//std::this_thread::sleep_for(std::chrono::microseconds(1));
+		}
+		std::cout << "push finish" << std::endl;
+	};
+	auto thread_to_pop = [&stack](int id) {
+		while(true) {
+			auto ret = stack.pop();
+			/*
+			if(ret == nullptr) std::cout << id << ": nullptr" << std::endl;
+			else std::cout << id << ": " << *ret << std::endl;
+			*/
+			std::this_thread::sleep_for(std::chrono::microseconds(10));
+		}
+	};
+	int push_num = std::thread::hardware_concurrency() / 2;
+	int pop_num = std::thread::hardware_concurrency() - push_num;
+	std::vector<std::thread> threads;
+	for(int i = 0; i < push_num; i++) {
+		threads.emplace_back(std::thread(thread_to_push));
+	}
+	for(int i = 0; i < pop_num; i++) {
+		threads.emplace_back(std::thread(thread_to_pop, i));
+	}
+	/*
+	while(true) {
+		stack.pop();
+	}
+	*/
+	for(int i = 0; i < threads.size(); i++) {
+		threads[i].join();
+	}
+}
+
+int main() {
+	try {
+	test_lock_free_stack_count();
+	} catch(std::exception& e) {
+		std::cout << e.what() << std::endl;
+		std::cout << "test error" << std::endl;
+	}
+}
